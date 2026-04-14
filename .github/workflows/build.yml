@@ -15,10 +15,13 @@ permissions:
   contents: write
 
 jobs:
+  # --------------------------------------------------------------------
+  # Job 1: fetch source lists, compile .srs files, push to release branch
+  # --------------------------------------------------------------------
   build:
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      release_tag: ${{ steps.tag.outputs.release_tag }}
 
     steps:
       - name: Checkout repository
@@ -35,16 +38,11 @@ jobs:
       - name: Show output
         run: ls -lh output/
 
-      # ------------------------------------------------------------------
-      # Commit compiled files to the dedicated `release` branch so
-      # consumers can fetch them via raw.githubusercontent.com.
-      # ------------------------------------------------------------------
       - name: Push output to release branch
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Stash built files before switching branches
           cp -r output/ /tmp/srs-output/
 
           git fetch origin release
@@ -59,22 +57,36 @@ jobs:
             git push origin release
           fi
 
-          # Return to the original branch so subsequent steps still work
-          git checkout -
-
-      # ------------------------------------------------------------------
-      # Publish a dated GitHub Release (tag: YYYY-MM-DD).
-      # If the workflow fires more than once on the same day the existing
-      # release for that date is updated in-place.
-      # ------------------------------------------------------------------
       - name: Set release tag
-        run: echo "RELEASE_TAG=$(date -u +'%Y-%m-%d')" >> "$GITHUB_ENV"
+        id: tag
+        run: echo "release_tag=$(date -u +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rule-sets
+          path: output/
+          retention-days: 1
+
+  # --------------------------------------------------------------------
+  # Job 2: publish a dated GitHub Release with the compiled files
+  # --------------------------------------------------------------------
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rule-sets
+          path: output/
 
       - name: Create or update dated release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: "Rule sets ${{ env.RELEASE_TAG }}"
+          tag_name: ${{ needs.build.outputs.release_tag }}
+          name: "Rule sets ${{ needs.build.outputs.release_tag }}"
           body: |
             Automatically built from
             [hxehex/russia-mobile-internet-whitelist](https://github.com/hxehex/russia-mobile-internet-whitelist).
@@ -92,14 +104,24 @@ jobs:
             output/russia-mobile-whitelist-domains.json
             output/russia-mobile-whitelist-cidr.json
 
-      # ------------------------------------------------------------------
-      # Keep only the 7 most recent dated releases; delete everything older.
-      # ------------------------------------------------------------------
+  # --------------------------------------------------------------------
+  # Job 3: delete releases older than the 7 most recent
+  # --------------------------------------------------------------------
+  prune:
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
       - name: Prune old releases (keep latest 7)
         run: |
-          gh release list --limit 100 --json tagName,publishedAt \
+          gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 100 \
+            --json tagName,publishedAt \
             --jq 'sort_by(.publishedAt) | reverse | .[7:][].tagName' \
             | while IFS= read -r tag; do
                 echo "Deleting old release: $tag"
-                gh release delete "$tag" --yes --cleanup-tag
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
               done
