@@ -17,6 +17,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout repository
@@ -34,30 +36,45 @@ jobs:
         run: ls -lh output/
 
       # ------------------------------------------------------------------
-      # Commit compiled files back to the repository so consumers can
-      # reference them via raw.githubusercontent.com URLs.
+      # Commit compiled files to the dedicated `release` branch so
+      # consumers can fetch them via raw.githubusercontent.com.
       # ------------------------------------------------------------------
-      - name: Commit output files
+      - name: Push output to release branch
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/
+
+          # Stash built files before switching branches
+          cp -r output/ /tmp/srs-output/
+
+          git fetch origin release
+          git checkout release
+
+          cp /tmp/srs-output/*.srs /tmp/srs-output/*.json .
+          git add *.srs *.json
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
             git commit -m "chore: update rule sets $(date -u +'%Y-%m-%d')"
-            git push
+            git push origin release
           fi
 
+          # Return to the original branch so subsequent steps still work
+          git checkout -
+
       # ------------------------------------------------------------------
-      # Also publish / update a "latest" GitHub Release so users can
-      # reference a stable download URL.
+      # Publish a dated GitHub Release (tag: YYYY-MM-DD).
+      # If the workflow fires more than once on the same day the existing
+      # release for that date is updated in-place.
       # ------------------------------------------------------------------
-      - name: Update latest release
+      - name: Set release tag
+        run: echo "RELEASE_TAG=$(date -u +'%Y-%m-%d')" >> "$GITHUB_ENV"
+
+      - name: Create or update dated release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: "Latest rule sets"
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Rule sets ${{ env.RELEASE_TAG }}"
           body: |
             Automatically built from
             [hxehex/russia-mobile-internet-whitelist](https://github.com/hxehex/russia-mobile-internet-whitelist).
@@ -68,12 +85,21 @@ jobs:
             | `russia-mobile-whitelist-cidr.srs`    | IP/CIDR-based rule set (`ip_cidr`) |
             | `russia-mobile-whitelist-domains.json` | sing-box JSON source (domains) |
             | `russia-mobile-whitelist-cidr.json`    | sing-box JSON source (CIDRs) |
-
-            Built: ${{ github.run_id }}
-          prerelease: false
           make_latest: true
           files: |
             output/russia-mobile-whitelist-domains.srs
             output/russia-mobile-whitelist-cidr.srs
             output/russia-mobile-whitelist-domains.json
             output/russia-mobile-whitelist-cidr.json
+
+      # ------------------------------------------------------------------
+      # Keep only the 7 most recent dated releases; delete everything older.
+      # ------------------------------------------------------------------
+      - name: Prune old releases (keep latest 7)
+        run: |
+          gh release list --limit 100 --json tagName,publishedAt \
+            --jq 'sort_by(.publishedAt) | reverse | .[7:][].tagName' \
+            | while IFS= read -r tag; do
+                echo "Deleting old release: $tag"
+                gh release delete "$tag" --yes --cleanup-tag
+              done
