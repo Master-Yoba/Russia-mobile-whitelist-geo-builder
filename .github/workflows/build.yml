@@ -15,8 +15,13 @@ permissions:
   contents: write
 
 jobs:
+  # --------------------------------------------------------------------
+  # Job 1: fetch source lists, compile .srs files, push to release branch
+  # --------------------------------------------------------------------
   build:
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.tag.outputs.release_tag }}
 
     steps:
       - name: Checkout repository
@@ -33,31 +38,55 @@ jobs:
       - name: Show output
         run: ls -lh output/
 
-      # ------------------------------------------------------------------
-      # Commit compiled files back to the repository so consumers can
-      # reference them via raw.githubusercontent.com URLs.
-      # ------------------------------------------------------------------
-      - name: Commit output files
+      - name: Push output to release branch
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/
+
+          cp -r output/ /tmp/srs-output/
+
+          git fetch origin release
+          git checkout release
+
+          cp /tmp/srs-output/*.srs /tmp/srs-output/*.json .
+          git add *.srs *.json
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
             git commit -m "chore: update rule sets $(date -u +'%Y-%m-%d')"
-            git push
+            git push origin release
           fi
 
-      # ------------------------------------------------------------------
-      # Also publish / update a "latest" GitHub Release so users can
-      # reference a stable download URL.
-      # ------------------------------------------------------------------
-      - name: Update latest release
+      - name: Set release tag
+        id: tag
+        run: echo "release_tag=$(date -u +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rule-sets
+          path: output/
+          retention-days: 1
+
+  # --------------------------------------------------------------------
+  # Job 2: publish a dated GitHub Release with the compiled files
+  # --------------------------------------------------------------------
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rule-sets
+          path: output/
+
+      - name: Create or update dated release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: "Latest rule sets"
+          tag_name: ${{ needs.build.outputs.release_tag }}
+          name: "Rule sets ${{ needs.build.outputs.release_tag }}"
           body: |
             Automatically built from
             [hxehex/russia-mobile-internet-whitelist](https://github.com/hxehex/russia-mobile-internet-whitelist).
@@ -68,12 +97,31 @@ jobs:
             | `russia-mobile-whitelist-cidr.srs`    | IP/CIDR-based rule set (`ip_cidr`) |
             | `russia-mobile-whitelist-domains.json` | sing-box JSON source (domains) |
             | `russia-mobile-whitelist-cidr.json`    | sing-box JSON source (CIDRs) |
-
-            Built: ${{ github.run_id }}
-          prerelease: false
           make_latest: true
           files: |
             output/russia-mobile-whitelist-domains.srs
             output/russia-mobile-whitelist-cidr.srs
             output/russia-mobile-whitelist-domains.json
             output/russia-mobile-whitelist-cidr.json
+
+  # --------------------------------------------------------------------
+  # Job 3: delete releases older than the 7 most recent
+  # --------------------------------------------------------------------
+  prune:
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Prune old releases (keep latest 7)
+        run: |
+          gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 100 \
+            --json tagName,publishedAt \
+            --jq 'sort_by(.publishedAt) | reverse | .[7:][].tagName' \
+            | while IFS= read -r tag; do
+                echo "Deleting old release: $tag"
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+              done
